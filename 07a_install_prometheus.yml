@@ -1,0 +1,261 @@
+---
+- name: Установка Prometheus в Kubernetes
+  hosts: k8s_master
+  become: yes
+  gather_facts: yes
+  vars:
+    monitoring_namespace: "monitoring"
+    prometheus_node: "k8s-worker-01"
+    helm_version: "3.14.0"
+    helm_bin: "/usr/local/bin/helm"
+
+  tasks:
+
+    # ============================================
+    # ШАГ 0. KUBECONFIG ДЛЯ ROOT
+    # ============================================
+    - name: Создать /root/.kube
+      file:
+        path: /root/.kube
+        state: directory
+        owner: root
+        group: root
+        mode: '0700'
+
+    - name: Скопировать kubeconfig для root
+      copy:
+        src: /home/aleksandr/.kube/config
+        dest: /root/.kube/config
+        remote_src: yes
+        owner: root
+        group: root
+        mode: '0600'
+
+    - name: Проверить kubectl от root
+      command: kubectl get nodes
+      environment:
+        KUBECONFIG: /root/.kube/config
+      register: kubectl_check
+      changed_when: false
+
+    - name: Показать ноды
+      debug:
+        msg: "{{ kubectl_check.stdout_lines }}"
+
+    # ============================================
+    # ШАГ 1. УСТАНОВКА HELM
+    # ============================================
+    - name: Проверить, установлен ли Helm
+      stat:
+        path: "{{ helm_bin }}"
+      register: helm_stat
+
+    - name: Скачать Helm
+      get_url:
+        url: "https://get.helm.sh/helm-v{{ helm_version }}-linux-amd64.tar.gz"
+        dest: /tmp/helm.tar.gz
+        mode: '0644'
+      when: not helm_stat.stat.exists
+
+    - name: Распаковать Helm
+      unarchive:
+        src: /tmp/helm.tar.gz
+        dest: /tmp
+        remote_src: yes
+      when: not helm_stat.stat.exists
+
+    - name: Установить Helm
+      copy:
+        src: /tmp/linux-amd64/helm
+        dest: "{{ helm_bin }}"
+        mode: '0755'
+        remote_src: yes
+      when: not helm_stat.stat.exists
+
+    - name: Создать симлинк Helm
+      file:
+        src: "{{ helm_bin }}"
+        dest: /usr/bin/helm
+        state: link
+      when: not helm_stat.stat.exists
+
+    - name: Проверить Helm
+      command: "{{ helm_bin }} version --short"
+      register: helm_version_check
+      changed_when: false
+
+    - name: Показать версию Helm
+      debug:
+        msg: "Helm: {{ helm_version_check.stdout }}"
+
+    # ============================================
+    # ШАГ 2. УСТАНОВКА LOCAL-PATH
+    # ============================================
+    - name: Проверить StorageClass
+      command: kubectl get storageclass
+      environment:
+        KUBECONFIG: /root/.kube/config
+      register: sc_check
+      changed_when: false
+      ignore_errors: yes
+
+    - name: Установить local-path-provisioner
+      command: kubectl apply -f https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.30/deploy/local-path-storage.yaml
+      environment:
+        KUBECONFIG: /root/.kube/config
+      when: "'local-path' not in sc_check.stdout"
+      changed_when: true
+
+    - name: Подождать 30 секунд
+      pause:
+        seconds: 30
+      when: "'local-path' not in sc_check.stdout"
+
+    - name: Сделать local-path дефолтным
+      command: >
+        kubectl patch storageclass local-path
+        -p '{"metadata": {"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
+      environment:
+        KUBECONFIG: /root/.kube/config
+      when: "'local-path' not in sc_check.stdout"
+      changed_when: true
+      ignore_errors: yes
+
+    - name: Проверить StorageClass
+      command: kubectl get storageclass
+      environment:
+        KUBECONFIG: /root/.kube/config
+      register: sc
+      changed_when: false
+
+    - name: Показать StorageClass
+      debug:
+        msg: "{{ sc.stdout_lines }}"
+
+    # ============================================
+    # ШАГ 3. ДОБАВИТЬ РЕПОЗИТОРИЙ
+    # ============================================
+    - name: Добавить репозиторий prometheus-community
+      command: "{{ helm_bin }} repo add prometheus-community https://prometheus-community.github.io/helm-charts"
+      changed_when: true
+      ignore_errors: yes
+
+    - name: Обновить репозитории
+      command: "{{ helm_bin }} repo update"
+      changed_when: true
+
+    # ============================================
+    # ШАГ 4. СОЗДАТЬ VALUES ФАЙЛ
+    # ============================================
+    - name: Создать values.yaml для Prometheus
+      copy:
+        content: |
+          server:
+            persistentVolume:
+              enabled: false
+            service:
+              type: NodePort
+              nodePort: 30090
+            nodeSelector:
+              kubernetes.io/hostname: {{ prometheus_node }}
+            image:
+              repository: prom/prometheus
+              tag: v2.54.1
+
+          alertmanager:
+            persistentVolume:
+              enabled: false
+            nodeSelector:
+              kubernetes.io/hostname: {{ prometheus_node }}
+            image:
+              repository: prom/alertmanager
+              tag: v0.27.0
+
+          pushgateway:
+            persistentVolume:
+              enabled: false
+            image:
+              repository: prom/pushgateway
+              tag: v1.9.0
+
+          kube-state-metrics:
+            nodeSelector:
+              kubernetes.io/hostname: {{ prometheus_node }}
+
+          prometheus-node-exporter:
+            nodeSelector:
+              kubernetes.io/hostname: {{ prometheus_node }}
+            image:
+              repository: prom/node-exporter
+              tag: v1.8.2
+        dest: /tmp/prometheus-values.yaml
+        mode: '0644'
+
+    # ============================================
+    # ШАГ 5. УДАЛИТЬ СТАРЫЙ РЕЛИЗ
+    # ============================================
+    - name: Удалить старый релиз Prometheus
+      command: "{{ helm_bin }} uninstall prometheus -n {{ monitoring_namespace }}"
+      environment:
+        KUBECONFIG: /root/.kube/config
+      ignore_errors: yes
+      changed_when: true
+
+    - name: Подождать 10 секунд
+      pause:
+        seconds: 10
+
+    # ============================================
+    # ШАГ 6. УСТАНОВИТЬ PROMETHEUS
+    # ============================================
+    - name: Установить Prometheus
+      command: >
+        {{ helm_bin }} upgrade --install prometheus
+        prometheus-community/prometheus
+        --namespace {{ monitoring_namespace }}
+        --create-namespace
+        --values /tmp/prometheus-values.yaml
+        --timeout 10m
+      environment:
+        KUBECONFIG: /root/.kube/config
+      register: helm_install
+      changed_when: true
+
+    - name: Показать результат
+      debug:
+        msg: "{{ helm_install.stdout_lines }}"
+
+    # ============================================
+    # ШАГ 7. ПРОВЕРКА
+    # ============================================
+    - name: Подождать 60 секунд
+      pause:
+        seconds: 60
+
+    - name: Проверить поды
+      command: kubectl get pods -n {{ monitoring_namespace }}
+      environment:
+        KUBECONFIG: /root/.kube/config
+      register: pods
+      changed_when: false
+
+    - name: Показать поды
+      debug:
+        msg: "{{ pods.stdout_lines }}"
+
+    - name: Проверить сервисы
+      command: kubectl get svc -n {{ monitoring_namespace }}
+      environment:
+        KUBECONFIG: /root/.kube/config
+      register: services
+      changed_when: false
+
+    - name: Показать сервисы
+      debug:
+        msg: "{{ services.stdout_lines }}"
+
+    - name: Показать информацию
+      debug:
+        msg:
+          - "Prometheus установлен!"
+          - "URL: http://{{ ansible_default_ipv4.address }}:30090"
